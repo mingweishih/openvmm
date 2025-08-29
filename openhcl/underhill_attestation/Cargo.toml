@@ -39,6 +39,7 @@ zerocopy.workspace = true
 disklayer_ram.workspace = true
 disk_backend.workspace = true
 vmgs_format.workspace = true
+guest_emulation_transport = { workspace = true, features = ["test_utilities"] }
 
 [lints]
 workspace = true

@@ -161,6 +161,7 @@ impl AsyncResolveResource<VmbusDeviceHandleKind, GuestEmulationDeviceHandle>
                 guest_state_encryption_policy:
                     get_protocol::dps_json::GuestStateEncryptionPolicy::default(),
                 management_vtl_features: get_protocol::dps_json::ManagementVtlFeatures::default(),
+                hardware_sealing_policy: get_protocol::dps_json::HardwareSealingPolicy::default(),
             },
             halt,
             resource.firmware_event_send,

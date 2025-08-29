@@ -35,6 +35,7 @@ use nvme_resources::fault::FaultConfiguration;
 use nvme_resources::fault::QueueFaultBehavior;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
+use pal_async::timer::PolledTimer;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::collections::btree_map;
@@ -85,6 +86,8 @@ pub struct AdminHandler {
     config: AdminConfig,
     #[inspect(iter_by_key)]
     namespaces: BTreeMap<u32, Arc<Namespace>>,
+    #[inspect(skip)]
+    timer: PolledTimer,
 }
 
 #[derive(Inspect)]
@@ -360,9 +363,10 @@ pub struct NsidConflict(u32);
 impl AdminHandler {
     pub fn new(driver: VmTaskDriver, config: AdminConfig) -> Self {
         Self {
-            driver,
+            driver: driver.clone(),
             config,
             namespaces: Default::default(),
+            timer: PolledTimer::new(&driver),
         }
     }
 
@@ -473,7 +477,7 @@ impl AdminHandler {
                         .admin_submission_queue_faults
                         .iter()
                         .find(|(op, _)| *op == opcode.0)
-                        .map(|(_, behavior)| *behavior)
+                        .map(|(_, behavior)| behavior.clone())
                         .unwrap_or_else(|| QueueFaultBehavior::Default);
 
                     match fault {
@@ -491,6 +495,15 @@ impl AdminHandler {
                                 &command
                             );
                             return Ok(());
+                        }
+                        QueueFaultBehavior::Delay(duration) => {
+                            self.timer.sleep(duration).await;
+                        }
+                        QueueFaultBehavior::Panic(message) => {
+                            panic!(
+                                "configured fault: admin command panic with command: {:?} and message: {}",
+                                &command, &message
+                            );
                         }
                         QueueFaultBehavior::Default => {}
                     }

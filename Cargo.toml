@@ -14,6 +14,7 @@ members = [
   "openhcl/ohcldiag-dev",
   "openhcl/openhcl_boot",
   "openhcl/openvmm_hcl",
+  "openhcl/migration_agent",
   "openhcl/sidecar",
   "openhcl/vmfirmwareigvm_dll",
   # tmk
@@ -181,6 +182,7 @@ hcl = { path = "openhcl/hcl" }
 hcl_mapper = { path = "openhcl/hcl_mapper" }
 host_fdt_parser = { path = "openhcl/host_fdt_parser" }
 kmsg_defs = { path = "openhcl/kmsg_defs" }
+migration_agent_core = { path = "openhcl/migration_agent_core" }
 lower_vtl_permissions_guard = { path = "openhcl/lower_vtl_permissions_guard" }
 minimal_rt = { path = "openhcl/minimal_rt" }
 minimal_rt_build = { path = "openhcl/minimal_rt_build" }

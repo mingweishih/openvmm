@@ -1,0 +1,15 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "migration_agent"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+migration_agent_core.workspace = true
+underhill_init.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

@@ -4298,6 +4298,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "migration_agent"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "migration_agent_core",
+ "underhill_init",
+]
+
+[[package]]
+name = "migration_agent_core"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "build_info",
+ "cvm_tracing",
+ "diag_proto",
+ "diag_server",
+ "futures",
+ "futures-concurrency",
+ "get_helpers",
+ "get_protocol",
+ "guest_emulation_transport",
+ "inspect",
+ "kmsg_defs",
+ "kmsg_writer",
+ "mesh",
+ "mesh_tracing",
+ "pal_async",
+ "tracelimit",
+ "tracing",
+ "tracing-subscriber",
+ "tracing_helpers",
+ "underhill_confidentiality",
+ "vmbus_async",
+ "vmbus_user_channel",
+ "vmsocket",
+]
+
+[[package]]
 name = "mimalloc"
 version = "0.1.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"

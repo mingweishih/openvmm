@@ -1,0 +1,51 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "migration_agent_core"
+edition.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Tracing infrastructure
+cvm_tracing.workspace = true
+get_helpers.workspace = true
+get_protocol.workspace = true
+kmsg_defs.workspace = true
+kmsg_writer.workspace = true
+mesh_tracing.workspace = true
+tracing_helpers.workspace = true
+tracelimit.workspace = true
+
+# Diagnostics server (uhdiag support)
+diag_proto.workspace = true
+diag_server.workspace = true
+build_info.workspace = true
+
+# Mesh / async runtime
+mesh.workspace = true
+pal_async.workspace = true
+
+# GET client (for VTL0 start signal to host)
+guest_emulation_transport.workspace = true
+
+# VMBus (for GET tracing channel to host)
+vmbus_async.workspace = true
+vmbus_user_channel.workspace = true
+
+# CVM support
+underhill_confidentiality = { workspace = true, features = ["std"] }
+
+# Socket support (for diag server vsock)
+vmsocket.workspace = true
+
+# General
+anyhow.workspace = true
+futures.workspace = true
+futures-concurrency.workspace = true
+inspect.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["registry"] }
+
+[lints]
+workspace = true

@@ -18,6 +18,12 @@ parking_lot.workspace = true
 test_igvm_agent_lib.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+windows = { workspace = true, features = [
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Wmi",
+    "Win32_System_Variant",
+] }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Memory",

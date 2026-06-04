@@ -4,9 +4,32 @@
 use crate::rpc::igvm_agent;
 use guid::Guid;
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::mem::size_of;
 use std::ptr;
 use std::slice;
+use windows::Win32::System::Com::CLSCTX_INPROC_SERVER;
+use windows::Win32::System::Com::COINIT_MULTITHREADED;
+use windows::Win32::System::Com::CoCreateInstance;
+use windows::Win32::System::Com::CoInitializeEx;
+use windows::Win32::System::Com::CoInitializeSecurity;
+use windows::Win32::System::Com::EOAC_NONE;
+use windows::Win32::System::Com::RPC_C_AUTHN_LEVEL_DEFAULT;
+use windows::Win32::System::Com::RPC_C_IMP_LEVEL_IMPERSONATE;
+use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::System::Variant::VARIANT_0;
+use windows::Win32::System::Variant::VARIANT_0_0;
+use windows::Win32::System::Variant::VARIANT_0_0_0;
+use windows::Win32::System::Variant::VT_BSTR;
+use windows::Win32::System::Wmi::IEnumWbemClassObject;
+use windows::Win32::System::Wmi::IWbemClassObject;
+use windows::Win32::System::Wmi::IWbemObjectTextSrc;
+use windows::Win32::System::Wmi::WBEM_FLAG_FORWARD_ONLY;
+use windows::Win32::System::Wmi::WBEM_FLAG_RETURN_IMMEDIATELY;
+use windows::Win32::System::Wmi::WBEM_INFINITE;
+use windows::Win32::System::Wmi::WbemLocator;
+use windows::Win32::System::Wmi::WbemObjectTextSrc;
+use windows::core::BSTR;
 use windows_sys::Win32::Foundation::E_FAIL;
 use windows_sys::Win32::Foundation::E_INVALIDARG;
 use windows_sys::Win32::Foundation::E_OUTOFMEMORY;
@@ -166,6 +189,338 @@ fn read_utf16(ptr: *const u16) -> Option<String> {
     }
 }
 
+const WMI_NAMESPACE: &str = "root\\virtualization\\v2";
+
+/// Fetch the next WMI object from an enumerator, or `None` if exhausted.
+///
+/// # Safety
+/// Caller must ensure the enumerator is valid.
+unsafe fn wmi_next_object(
+    enumerator: &IEnumWbemClassObject,
+) -> windows::core::Result<Option<IWbemClassObject>> {
+    let mut objs = [None; 1];
+    let mut returned = 0;
+    // SAFETY: COM call with valid enumerator.
+    unsafe {
+        enumerator
+            .Next(WBEM_INFINITE, &mut objs, &mut returned)
+            .ok()?;
+    }
+    if returned == 0 {
+        return Ok(None);
+    }
+    Ok(objs[0].take())
+}
+
+/// Read a string property from a WMI object.
+///
+/// # Safety
+/// Caller must ensure `obj` is valid and `name` corresponds to a string property.
+unsafe fn wmi_get_string_property(
+    obj: &IWbemClassObject,
+    name: &str,
+) -> windows::core::Result<String> {
+    let mut val = VARIANT::default();
+    // SAFETY: COM call with valid object.
+    unsafe {
+        obj.Get(&BSTR::from(name), 0, &mut val, None, None)?;
+    }
+    // SAFETY: Access the bstrVal union field from the VARIANT.
+    let bstr_ptr = unsafe { &val.Anonymous.Anonymous.Anonymous.bstrVal };
+    if bstr_ptr.is_empty() {
+        return Err(windows::core::Error::new(
+            windows::core::HRESULT(-1),
+            format!("property '{name}' is not a string"),
+        ));
+    }
+    Ok(bstr_ptr.to_string())
+}
+
+/// Read a `uint32` property from a WMI object.
+///
+/// # Safety
+/// Caller must ensure `obj` is valid and `name` corresponds to a uint32 property.
+unsafe fn wmi_get_u32_property(obj: &IWbemClassObject, name: &str) -> windows::core::Result<u32> {
+    let mut val = VARIANT::default();
+    // SAFETY: COM call with valid object.
+    unsafe {
+        obj.Get(&BSTR::from(name), 0, &mut val, None, None)?;
+    }
+    // SAFETY: Access the lVal union field from the VARIANT.
+    let n = unsafe { val.Anonymous.Anonymous.Anonymous.lVal };
+    Ok(n as u32)
+}
+
+/// Read a byte-array (`uint8[]`) property from a WMI object by extracting the
+/// underlying `SAFEARRAY`.
+///
+/// # Safety
+/// Caller must ensure `obj` is valid and `name` corresponds to a `uint8[]` property.
+unsafe fn wmi_get_byte_array_property(
+    obj: &IWbemClassObject,
+    name: &str,
+) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::System::Ole::SafeArrayAccessData;
+    use windows::Win32::System::Ole::SafeArrayGetLBound;
+    use windows::Win32::System::Ole::SafeArrayGetUBound;
+    use windows::Win32::System::Ole::SafeArrayUnaccessData;
+
+    let mut val = VARIANT::default();
+    // SAFETY: COM call with valid object.
+    unsafe {
+        obj.Get(&BSTR::from(name), 0, &mut val, None, None)?;
+    }
+
+    // SAFETY: Access the raw SAFEARRAY pointer from the VARIANT.
+    let psa = unsafe { val.Anonymous.Anonymous.Anonymous.parray };
+    if psa.is_null() {
+        return Ok(vec![]);
+    }
+
+    let mut pdata = ptr::null_mut();
+    // SAFETY: `psa` is a valid SAFEARRAY from WMI.
+    unsafe {
+        SafeArrayAccessData(psa as *const _, &mut pdata)?;
+    }
+
+    // SAFETY: `psa` is a valid SAFEARRAY; reading lower/upper bounds is safe.
+    let len = unsafe {
+        let lower = SafeArrayGetLBound(psa as *const _, 1)?;
+        let upper = SafeArrayGetUBound(psa as *const _, 1)?;
+        (upper - lower + 1) as usize
+    };
+
+    // SAFETY: `pdata` points to `len` contiguous `u8` values.
+    let slice = unsafe { slice::from_raw_parts(pdata as *const u8, len) };
+    let result = slice.to_vec();
+
+    // SAFETY: Unlock the safe-array.
+    unsafe {
+        SafeArrayUnaccessData(psa as *const _)?;
+    }
+
+    Ok(result)
+}
+
+/// Retrieve CoRIM endorsement data for a VM by invoking the
+/// `Msvm_SecurityService.GetCorimEndorsement` WMI method.
+///
+/// This is the Rust equivalent of the following PowerShell:
+/// ```powershell
+/// $vm = Get-CimInstance -Namespace root\virtualization\v2 \
+///         -ClassName Msvm_ComputerSystem -Filter "ElementName = '$vmName'"
+/// $secSvc = Get-CimInstance -Namespace root\virtualization\v2 \
+///         -ClassName Msvm_SecurityService
+/// $vssd = Get-CimAssociatedInstance -InputObject $vm \
+///         -ResultClassName Msvm_VirtualSystemSettingData
+/// $secData = Get-CimAssociatedInstance -InputObject $vssd \
+///         -ResultClassName Msvm_SecuritySettingData
+/// $embedded = $secData | ConvertTo-CimEmbeddedString
+/// $result = Invoke-CimMethod -InputObject $secSvc \
+///         -MethodName GetCorimEndorsement \
+///         -Arguments @{ SecuritySettingData = $embedded }
+/// ```
+fn get_corim_endorsement_via_wmi(vm_name: &str) -> windows::core::Result<Vec<u8>> {
+    // RPC_E_TOO_LATE: CoInitializeSecurity was already called for this process.
+    const RPC_E_TOO_LATE: windows::core::HRESULT = windows::core::HRESULT(0x80010119_u32 as i32);
+
+    tracing::info!(vm_name, "Starting CoRIM endorsement retrieval via WMI");
+
+    // SAFETY: All COM/WMI pointers below originate from COM and are validated
+    // before use; the function performs a closed sequence of calls and frees
+    // any resources via RAII (IUnknown::Release on smart pointers).
+    unsafe {
+        // Initialize COM (multithreaded apartment).
+        // S_FALSE (already initialized on this thread) is non-negative, so .ok() succeeds.
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+
+        // CoInitializeSecurity can only be called once per process.
+        // Ignore RPC_E_TOO_LATE if it was already configured.
+        if let Err(e) = CoInitializeSecurity(
+            None,
+            -1,
+            None,
+            None,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            None,
+            EOAC_NONE,
+            None,
+        ) {
+            if e.code() != RPC_E_TOO_LATE {
+                return Err(e);
+            }
+        }
+
+        // Connect to the Hyper-V WMI namespace.
+        let locator: windows::Win32::System::Wmi::IWbemLocator =
+            CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)?;
+
+        let svc = locator.ConnectServer(
+            &BSTR::from(WMI_NAMESPACE),
+            &BSTR::new(),
+            &BSTR::new(),
+            &BSTR::new(),
+            0,
+            &BSTR::new(),
+            None,
+        )?;
+
+        // 1. Query the VM by its display name.
+        let vm_query = format!("SELECT * FROM Msvm_ComputerSystem WHERE ElementName = '{vm_name}'");
+        let vm_enum = svc.ExecQuery(
+            &BSTR::from("WQL"),
+            &BSTR::from(vm_query),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            None,
+        )?;
+        let vm = wmi_next_object(&vm_enum)?.ok_or_else(|| {
+            windows::core::Error::new(
+                windows::core::HRESULT(-1),
+                format!("VM '{vm_name}' not found in Msvm_ComputerSystem"),
+            )
+        })?;
+
+        // 2. Get Msvm_SecurityService (singleton).
+        let sec_svc_enum = svc.ExecQuery(
+            &BSTR::from("WQL"),
+            &BSTR::from("SELECT * FROM Msvm_SecurityService"),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            None,
+        )?;
+        let sec_svc = wmi_next_object(&sec_svc_enum)?.ok_or_else(|| {
+            windows::core::Error::new(windows::core::HRESULT(-1), "Msvm_SecurityService not found")
+        })?;
+
+        // 3. Walk association: VM -> VirtualSystemSettingData.
+        let vm_path = wmi_get_string_property(&vm, "__PATH")?;
+        let vssd_query = format!(
+            "ASSOCIATORS OF {{{vm_path}}} WHERE ResultClass = Msvm_VirtualSystemSettingData"
+        );
+        let vssd_enum = svc.ExecQuery(
+            &BSTR::from("WQL"),
+            &BSTR::from(&vssd_query),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            None,
+        )?;
+        let vssd = wmi_next_object(&vssd_enum)?.ok_or_else(|| {
+            windows::core::Error::new(
+                windows::core::HRESULT(-1),
+                "Msvm_VirtualSystemSettingData not found",
+            )
+        })?;
+
+        // 4. Walk association: VSSD -> SecuritySettingData.
+        let vssd_path = wmi_get_string_property(&vssd, "__PATH")?;
+        let sec_data_query =
+            format!("ASSOCIATORS OF {{{vssd_path}}} WHERE ResultClass = Msvm_SecuritySettingData");
+        let sec_data_enum = svc.ExecQuery(
+            &BSTR::from("WQL"),
+            &BSTR::from(&sec_data_query),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            None,
+        )?;
+        let sec_data = wmi_next_object(&sec_data_enum)?.ok_or_else(|| {
+            windows::core::Error::new(
+                windows::core::HRESULT(-1),
+                "Msvm_SecuritySettingData not found",
+            )
+        })?;
+
+        // 5. Serialize to CIM-XML embedded-instance string.
+        // This is the COM equivalent of PowerShell's ConvertTo-CimEmbeddedString.
+        // WMI_OBJ_TEXT_WMI_DTD_2_0 (= 2) produces CIM-XML DTD 2.0 format, which
+        // is what Hyper-V WMI methods expect for embedded instances.
+        let text_src: IWbemObjectTextSrc =
+            CoCreateInstance(&WbemObjectTextSrc, None, CLSCTX_INPROC_SERVER)?;
+        let embedded_str = text_src.GetText(0, &sec_data, 2, None)?;
+
+        // 6. Prepare input parameters for GetCorimEndorsement.
+        let sec_svc_class_name = wmi_get_string_property(&sec_svc, "__CLASS")?;
+        let mut sec_svc_class_obj: Option<IWbemClassObject> = None;
+        svc.GetObject(
+            &BSTR::from(&sec_svc_class_name),
+            Default::default(),
+            None,
+            Some(&mut sec_svc_class_obj),
+            None,
+        )?;
+        let sec_svc_class = sec_svc_class_obj.ok_or_else(|| {
+            windows::core::Error::new(
+                windows::core::HRESULT(-1),
+                "Failed to get Msvm_SecurityService class",
+            )
+        })?;
+
+        let mut in_params_def: Option<IWbemClassObject> = None;
+        sec_svc_class.GetMethod(
+            &BSTR::from("GetCorimEndorsement"),
+            0,
+            &mut in_params_def,
+            &mut None,
+        )?;
+        let in_params_def = in_params_def.ok_or_else(|| {
+            windows::core::Error::new(
+                windows::core::HRESULT(-1),
+                "GetCorimEndorsement has no input parameters",
+            )
+        })?;
+
+        let in_params = in_params_def.SpawnInstance(0)?;
+        let embedded_bstr = BSTR::from(embedded_str.to_string());
+        let bstr_variant = VARIANT {
+            Anonymous: VARIANT_0 {
+                Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                    vt: VT_BSTR,
+                    wReserved1: 0,
+                    wReserved2: 0,
+                    wReserved3: 0,
+                    Anonymous: VARIANT_0_0_0 {
+                        bstrVal: ManuallyDrop::new(embedded_bstr),
+                    },
+                }),
+            },
+        };
+        in_params.Put(&BSTR::from("SecuritySettingData"), 0, &bstr_variant, 0)?;
+
+        // 7. Invoke the method.
+        let sec_svc_path = wmi_get_string_property(&sec_svc, "__PATH")?;
+        let mut out_params: Option<IWbemClassObject> = None;
+        svc.ExecMethod(
+            &BSTR::from(&sec_svc_path),
+            &BSTR::from("GetCorimEndorsement"),
+            Default::default(),
+            None,
+            &in_params,
+            Some(&mut out_params),
+            None,
+        )?;
+        let out_params = out_params.ok_or_else(|| {
+            windows::core::Error::new(
+                windows::core::HRESULT(-1),
+                "No output returned from GetCorimEndorsement",
+            )
+        })?;
+
+        // 8. Read results.
+        let return_value = wmi_get_u32_property(&out_params, "ReturnValue")?;
+        if return_value != 0 {
+            return Err(windows::core::Error::new(
+                windows::core::HRESULT(return_value as i32),
+                format!("GetCorimEndorsement failed with return value {return_value}"),
+            ));
+        }
+
+        let corim_bytes = wmi_get_byte_array_property(&out_params, "CorimEndorsement")?;
+        tracing::info!(
+            corim_len = corim_bytes.len(),
+            "Retrieved CorimEndorsement data via WMI"
+        );
+
+        Ok(corim_bytes)
+    }
+}
+
 /// Entry point that services `RpcIGVmAttest` requests for the test agent.
 // SAFETY: FFI
 #[unsafe(export_name = "RpcIGVmAttest")]
@@ -222,8 +577,34 @@ pub extern "system" fn rpc_igvm_attest(
     );
 
     let vm_name_ref = vm_name_str.as_deref().unwrap_or("");
-    let payload = match igvm_agent::process_igvm_attest(read_guid(vm_id), vm_name_ref, report_slice)
-    {
+
+    // Best-effort: fetch the CoRIM endorsement from the host via WMI so the
+    // agent can compare it against the launch measurement in the hardware
+    // report. Failures here are non-fatal because some test environments
+    // (e.g., older Hyper-V builds without GetCorimEndorsement) won't expose
+    // the method, but the rest of the attestation flow is still valid.
+    let corim_data = if !vm_name_ref.is_empty() {
+        match get_corim_endorsement_via_wmi(vm_name_ref) {
+            Ok(data) => Some(data),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to retrieve CoRIM endorsement via WMI (non-fatal)"
+                );
+                None
+            }
+        }
+    } else {
+        tracing::warn!("VM name not available, skipping CoRIM endorsement retrieval");
+        None
+    };
+
+    let payload = match igvm_agent::process_igvm_attest(
+        read_guid(vm_id),
+        vm_name_ref,
+        report_slice,
+        corim_data.as_deref(),
+    ) {
         Ok(payload) => payload,
         Err(err) => {
             tracing::error!(?err, "igvm_agent::process_igvm_attest failed");

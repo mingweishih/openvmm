@@ -905,7 +905,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
 
             state
                 .igvm_agent
-                .handle_request(&request.report[..request.report_length as usize])
+                .handle_request(&request.report[..request.report_length as usize], None)
                 .map_err(Error::TestIgvmAgent)?
         };
 

@@ -10,6 +10,7 @@
 
 //! NOTE: This is a test implementation and should not be used in production.
 
+mod corim_check;
 use base64::Engine;
 use crypto::rsa::RsaKeyPair;
 use crypto::rsa::RsaPublicKey;
@@ -356,12 +357,39 @@ impl TestIgvmAgent {
     }
 
     /// Request handler.
-    pub fn handle_request(&mut self, request_bytes: &[u8]) -> Result<(Vec<u8>, u32), Error> {
+    ///
+    /// `corim_endorsement` is an optional CoRIM endorsement (COSE_Sign1 over a
+    /// CoRIM document) retrieved from the host. When provided, the agent
+    /// parses it via the `corim` crate, extracts the launch measurement digest,
+    /// and cross-checks it against the launch measurement carried in the
+    /// hardware attestation report.
+    pub fn handle_request(
+        &mut self,
+        request_bytes: &[u8],
+        corim_endorsement: Option<&[u8]>,
+    ) -> Result<(Vec<u8>, u32), Error> {
         let _span = tracing::info_span!("igvm_agent", vm_name = %self.vm_name).entered();
 
         let request = IgvmAttestRequestBase::read_from_prefix(request_bytes)
             .map_err(|_| Error::InvalidIgvmAttestRequest)?
             .0; // TODO: zerocopy: map_err (https://github.com/microsoft/openvmm/issues/759)
+
+        // Cross-check the launch measurement in the CoRIM document against
+        // the measurement carried in the hardware attestation report. The
+        // check is best-effort: a missing or unparseable CoRIM, or a report
+        // type we don't know how to parse, is logged but never blocks the
+        // attestation flow itself.
+        if let Some(corim_bytes) = corim_endorsement {
+            corim_check::check_corim_against_report(
+                corim_bytes,
+                &request.attestation_report,
+                request.request_data.report_type,
+            );
+        } else {
+            tracing::info!(
+                "No CoRIM endorsement provided; skipping launch-measurement cross-check"
+            );
+        }
 
         // Validate and extract runtime claims
         // The version must be the current version to ensure the presence of the extension data structure.

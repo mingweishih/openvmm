@@ -258,6 +258,10 @@ pub fn gsp_state_refresh_requested(vm_id: &Guid) -> bool {
 /// 1. If the VM name matches a hardcoded pattern, that config is used.
 /// 2. Otherwise the default plan (if any) is installed.
 ///
+/// `corim_endorsement` is optional CoRIM data retrieved from the host via
+/// WMI; it is forwarded to the agent so the launch measurement embedded in
+/// the CoRIM document can be cross-checked against the hardware report.
+///
 /// The resolved config is also recorded keyed by `vm_id` so the GSP RPC path
 /// (which only sees the VM's runtime GUID, not the descriptive name) can
 /// recover it later in the same boot.
@@ -265,6 +269,7 @@ pub fn process_igvm_attest(
     vm_id: Option<Guid>,
     vm_name: &str,
     report: &[u8],
+    corim_endorsement: Option<&[u8]>,
 ) -> TestAgentResult<Vec<u8>> {
     let agent = {
         let mut reg = registry().lock();
@@ -300,7 +305,7 @@ pub fn process_igvm_attest(
     // outside the registry lock while preserving request order for this VM.
     let (payload, expected_len) = agent
         .lock()
-        .handle_request(report)
+        .handle_request(report, corim_endorsement)
         .map_err(|err| match err {
             Error::InvalidIgvmAttestRequest => TestAgentFacadeError::InvalidRequest,
             _ => TestAgentFacadeError::AgentFailure,

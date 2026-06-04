@@ -526,6 +526,7 @@ flate2 = "1.1"
 # --- Cryptography & secure computing ---
 constant_time_eq = "0.5"
 cms = { version = "0.3.0-pre.2", default-features = false }
+corim = "0.1.2"
 der = "0.8"
 getrandom = "0.4"
 ms-tpm-20-ref = { git = "https://github.com/microsoft/ms-tpm-20-ref-rs.git", rev = "9a24154df7b09cd1a0b90f25a7bf9cbb16e24c7d", default-features = false }

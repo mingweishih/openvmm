@@ -8090,14 +8090,18 @@ name = "test_igvm_agent_lib"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "corim",
  "crypto",
  "get_resources",
  "getrandom 0.4.2",
+ "hex",
+ "hvdef",
  "inspect",
  "openhcl_attestation_protocol",
  "serde_json",
  "thiserror 2.0.16",
  "tracing",
+ "x86defs",
  "zerocopy",
 ]
 
@@ -8115,6 +8119,7 @@ dependencies = [
  "test_igvm_agent_lib",
  "tracing",
  "tracing-subscriber",
+ "windows 0.62.0",
  "windows-sys 0.61.0",
 ]
 

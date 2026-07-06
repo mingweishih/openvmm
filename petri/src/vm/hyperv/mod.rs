@@ -11,7 +11,6 @@ use vmsocket::VmSocket;
 use crate::Disk;
 use crate::Drive;
 use crate::Firmware;
-use crate::IsolationType;
 use crate::ModifyFn;
 use crate::NoPetriVmInspector;
 use crate::OpenHclServicingFlags;
@@ -355,9 +354,14 @@ impl PetriVmmBackend for HyperVPetriBackend {
         // Attempt to enable COM3 and use that to get KMSG logs, otherwise
         // fall back to use diag_client.
         let supports_com3 = {
-            // Hyper-V VBS VMs don't work with COM3 enabled.
-            // Hypervisor support is needed for this to work.
-            let is_not_vbs = !matches!(config.firmware.isolation(), Some(IsolationType::Vbs));
+            // Isolated (confidential) VMs don't get usable paravisor kmsg over
+            // COM3: VBS VMs don't work with COM3 enabled (hypervisor support is
+            // needed), and SNP/TDX CVMs produce no COM3 output at all (the
+            // paravisor's kmsg is not wired to the serial port in isolated
+            // mode, so the log is always empty). For all isolated VMs, fall
+            // back to the diag_client kmsg path, which reaches the paravisor
+            // over the always-available diag channel.
+            let is_not_isolated = !properties.is_isolated;
 
             // The Hyper-V serial device for ARM doesn't support additional
             // serial ports yet.
@@ -372,7 +376,7 @@ impl PetriVmmBackend for HyperVPetriBackend {
             const COM3_MIN_WINVER: u32 = 27813;
             let is_supported_winver = current_winver.build >= COM3_MIN_WINVER;
 
-            properties.is_openhcl && is_not_vbs && is_x86 && is_supported_winver
+            properties.is_openhcl && is_not_isolated && is_x86 && is_supported_winver
         };
 
         // devnote: The imc_hiv and management_vtl_settings temp files are

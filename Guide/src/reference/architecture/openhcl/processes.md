@@ -98,30 +98,27 @@ completed write. Fresh hardware derivations verify the candidate before and
 after persistence. Neither remote key release nor a new migration protocol is
 required.
 
-Resealing is event-only: starting or resuming the worker does not verify or
-rewrite the protector. Each attempt creates a new protector using the current
-report's SVN, even if the hardware still matches. Failures retry with exponential
-backoff and jitter, capped at 60 seconds, without downgrading protection.
-Notifications do not bypass retry backoff, and successful attempts are at least
-one second apart. After success, the worker stays idle until another event.
-These retry and rate-limit intervals are implementation constants, not a
-host-controlled setting.
+Verification also runs at startup and approximately every five minutes, with
+up to 30 seconds of jitter. Periodic verification uses the stored protector's
+SVN and freshly derived keys; unchanged SVN alone does not establish unchanged
+hardware. A valid protector is left untouched. A stale protector is resealed
+using the current report's SVN. Failures retry with exponential backoff and
+jitter, capped at 60 seconds, without downgrading protection. Notifications do
+not bypass retry backoff, and successful attempts are at least one second apart.
+These intervals are implementation constants, not a host-controlled setting.
 
 The `hardware_reseal` state unit exposes check/reseal counters and a degraded
 flag through inspection, but no key material. Stopping the unit drains in-flight
-I/O before VMGS save. Pending notifications and retries survive normal stop/start
-without resetting retry backoff. Reconstruction from saved VMGS state explicitly
-latches a local restore signal to force a rewrite and flush, covering an earlier
-failed durability operation. This is not startup or periodic verification, and
-does not add isolated-VM servicing support.
+I/O before VMGS save; restarting verifies again. Reconstruction from saved VMGS
+state forces a rewrite and flush to cover an earlier failed durability operation.
+This lifecycle integration does not add isolated-VM servicing support.
 
 ```admonish warning
 This is best-effort recovery. A crash after migration but before successful
 destination resealing can leave hardware-only VMGS unrecoverable. The GET event
-has no completion handshake. Missing notifications, including those lost before
-callback installation, have no periodic verification coverage: the protector
-can remain stale until another event triggers recovery. Flush durability also
-depends on the backing storage honoring the request.
+has no completion handshake; periodic verification reduces exposure to missed
+events but cannot eliminate this crash window. Flush durability also depends on
+the backing storage honoring the request.
 ```
 
 ## Diagnostics Server (`diag_server`)

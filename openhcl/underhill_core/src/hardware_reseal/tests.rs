@@ -36,7 +36,7 @@ use vmgs_format::EncryptionAlgorithm;
 const DEK: [u8; 32] = [0xab; 32];
 
 #[test]
-fn successful_event_clears_pending_recovery_without_scheduling_more_work() {
+fn successful_check_schedules_periodic_verification_with_bounded_jitter() {
     let now = Instant::from_nanos(1_000_000_000);
     for jitter in 0..=u8::MAX {
         let mut schedule = Schedule::new(now);
@@ -49,7 +49,11 @@ fn successful_event_clears_pending_recovery_without_scheduling_more_work() {
         assert_eq!(schedule.failures, 0);
         assert!(!schedule.force_reseal);
         assert_eq!(schedule.not_before, now + MIN_RESEAL_INTERVAL);
-        assert_eq!(schedule.deadline, now);
+        assert_eq!(
+            schedule.due(),
+            now + VERIFY_INTERVAL + Duration::from_secs(u64::from(jitter % 31))
+        );
+        assert!(schedule.due() <= now + VERIFY_INTERVAL + Duration::from_secs(30));
     }
 }
 
@@ -257,14 +261,12 @@ fn config() -> AttestationVmConfig {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operation {
-    Read,
     Write,
     Flush,
 }
 
 #[derive(Default)]
 struct IoState {
-    reads: usize,
     writes: usize,
     flushes: usize,
     block_at: Option<(Operation, usize)>,
@@ -285,7 +287,6 @@ impl IoControl {
         let (block, fail) = {
             let mut state = self.state.lock();
             let count = match operation {
-                Operation::Read => &mut state.reads,
                 Operation::Write => &mut state.writes,
                 Operation::Flush => &mut state.flushes,
             };
@@ -388,7 +389,6 @@ impl DiskIo for GatedDisk {
         buffers: &RequestBuffers<'_>,
         sector: u64,
     ) -> Result<(), DiskError> {
-        self.io.before(Operation::Read).await?;
         self.disk.read_vectored(buffers, sector).await
     }
 
@@ -479,8 +479,8 @@ async fn drive_until<F: Future>(
 }
 
 // Return ownership at a Stop barrier so tests can advance private schedule
-// timestamps instead of sleeping. Start preserves those timestamps, and
-// already-running workers exercise polling without a Start request.
+// timestamps instead of sleeping. Already-running workers exercise the timer
+// path without a Start request resetting their deadline.
 async fn finish_attempt(
     worker: HardwareReseal,
     milestone: impl Future<Output = ()>,
@@ -502,48 +502,50 @@ async fn finish_attempt(
 }
 
 #[async_test]
-async fn start_and_resume_without_event_do_no_hardware_or_io_even_when_due(driver: DefaultDriver) {
-    for existing in [false, true] {
-        let mut fixture = Fixture::new(&driver, existing).await;
-        // Even stale or missing protectors must not create work without an event.
-        fixture.hardware.identity.store(0x73, Ordering::SeqCst);
-        let expired = Instant::from_nanos(0);
-        fixture.worker.schedule.deadline = expired;
-        fixture.worker.schedule.not_before = expired;
-        for _ in 0..2 {
-            fixture.worker = finish_attempt(fixture.worker, std::future::ready(())).await;
-            assert_eq!(fixture.worker.checks, 0);
-            assert_eq!(fixture.worker.reseals, 0);
-            assert!(!fixture.worker.degraded);
-            assert!(!fixture.worker.schedule.running);
-            assert!(!fixture.worker.schedule.force_reseal);
-            assert_eq!(fixture.worker.schedule.deadline, expired);
-            assert_eq!(fixture.worker.schedule.not_before, expired);
-            assert_eq!(fixture.hardware.reports.load(Ordering::SeqCst), 0);
-            assert_eq!(fixture.hardware.derivations.load(Ordering::SeqCst), 0);
-            assert_eq!(fixture.io.state.lock().reads, 0);
-            assert_eq!(fixture.io.state.lock().writes, 0);
-            assert_eq!(fixture.io.state.lock().flushes, 0);
-        }
-        assert!(fixture.worker.save().await.unwrap().is_none());
-        fixture.close().await;
-    }
+async fn start_verifies_existing_protector_without_writing(driver: DefaultDriver) {
+    let mut fixture = Fixture::new(&driver, true).await;
+    let before = fixture
+        .worker
+        .vmgs
+        .read_file(FileId::HW_KEY_PROTECTOR)
+        .await
+        .unwrap();
+    fixture.worker = finish_attempt(fixture.worker, fixture.hardware.reached(0, 1)).await;
+    assert_eq!(fixture.worker.checks, 1);
+    assert_eq!(fixture.worker.reseals, 0);
+    assert!(!fixture.worker.degraded);
+    assert!(!fixture.worker.schedule.running);
+    assert_eq!(fixture.hardware.reports.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.hardware.derivations.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.io.state.lock().writes, 0);
+    assert_eq!(fixture.io.state.lock().flushes, 0);
+    assert!(
+        fixture
+            .worker
+            .vmgs
+            .read_file(FileId::HW_KEY_PROTECTOR)
+            .await
+            .unwrap()
+            == before
+    );
+    assert!(fixture.worker.save().await.unwrap().is_none());
+    fixture.close().await;
 }
 
 #[async_test]
 async fn explicit_notification_reseals_even_matching_hardware_with_same_dek(driver: DefaultDriver) {
     let mut fixture = Fixture::new(&driver, true).await;
-    // Only the notification makes the distant deadline due.
+    fixture.worker = finish_attempt(fixture.worker, fixture.hardware.reached(0, 1)).await;
+    // Leave startup behind: only the notification makes the distant deadline due.
     fixture.worker.schedule.running = true;
     fixture.worker.schedule.not_before = Instant::now();
-    fixture.worker.schedule.deadline = Instant::now() + Duration::from_secs(86400);
+    fixture.worker.schedule.deadline = Instant::now() + VERIFY_INTERVAL;
     fixture.worker.notification.notify();
-    fixture.worker.notification.notify();
-    fixture.worker = finish_attempt(fixture.worker, fixture.hardware.reached(1, 3)).await;
-    assert_eq!(fixture.worker.checks, 1);
+    fixture.worker = finish_attempt(fixture.worker, fixture.hardware.reached(1, 4)).await;
+    assert_eq!(fixture.worker.checks, 2);
     assert_eq!(fixture.worker.reseals, 1);
     assert_eq!(fixture.hardware.reports.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.hardware.derivations.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.hardware.derivations.load(Ordering::SeqCst), 4);
     assert_eq!(fixture.io.state.lock().flushes, 2);
     assert!(fixture.worker.vmgs.active_encryption_key().await.unwrap() == DEK);
     let protector = fixture
@@ -560,36 +562,20 @@ async fn explicit_notification_reseals_even_matching_hardware_with_same_dek(driv
 }
 
 #[async_test]
-async fn event_recovers_migration_and_success_stays_idle_without_more_events(
-    driver: DefaultDriver,
-) {
+async fn periodic_check_recovers_migration_without_notification(driver: DefaultDriver) {
     let mut fixture = Fixture::new(&driver, true).await;
+    fixture.worker = finish_attempt(fixture.worker, fixture.hardware.reached(0, 1)).await;
     fixture.hardware.identity.store(0x73, Ordering::SeqCst);
-    fixture.worker.notification.notify();
-    fixture.worker = finish_attempt(fixture.worker, fixture.hardware.reached(1, 3)).await;
-    assert_eq!(fixture.worker.checks, 1);
+    fixture.worker.schedule.running = true;
+    fixture.worker.schedule.not_before = Instant::now();
+    fixture.worker.schedule.deadline = Instant::now();
+    assert!(!fixture.worker.schedule.force_reseal);
+    assert!(!fixture.worker.notification.pending.load(Ordering::SeqCst));
+    fixture.worker = finish_attempt(fixture.worker, fixture.hardware.reached(1, 5)).await;
+    assert_eq!(fixture.worker.checks, 2);
     assert_eq!(fixture.worker.reseals, 1);
     assert!(!fixture.worker.degraded);
     assert!(fixture.worker.vmgs.active_encryption_key().await.unwrap() == DEK);
-
-    *fixture.io.state.lock() = IoState::default();
-    // Advance past all deadlines without sleeping. Check both the running
-    // polling path and a normal restart: neither should repeat successful work.
-    for running in [true, false] {
-        fixture.worker.schedule.running = running;
-        fixture.worker.schedule.deadline = Instant::from_nanos(0);
-        fixture.worker.schedule.not_before = Instant::from_nanos(0);
-        fixture.worker = finish_attempt(fixture.worker, std::future::ready(())).await;
-        assert_eq!(fixture.worker.checks, 1);
-        assert_eq!(fixture.worker.reseals, 1);
-        assert!(!fixture.worker.schedule.force_reseal);
-        assert!(!fixture.worker.notification.pending.load(Ordering::SeqCst));
-        assert_eq!(fixture.hardware.reports.load(Ordering::SeqCst), 1);
-        assert_eq!(fixture.hardware.derivations.load(Ordering::SeqCst), 3);
-        assert_eq!(fixture.io.state.lock().reads, 0);
-        assert_eq!(fixture.io.state.lock().writes, 0);
-        assert_eq!(fixture.io.state.lock().flushes, 0);
-    }
 
     // Check persisted bytes through a freshly opened store, not the broker cache.
     let disk = fixture.disk.clone();
@@ -645,7 +631,6 @@ async fn stop_drains_blocked_write_and_final_flush_and_retains_late_event(driver
         let mut fixture = Fixture::new(&driver, false).await;
         fixture.io.state.lock().block_at = Some(block_at);
         let notification = fixture.worker.notification.clone();
-        notification.notify();
         let (send, recv) = mesh::mpsc_channel();
         let mut run = pin!(fixture.worker.run(recv));
         drive_until(run.as_mut(), send.call(StateRequest::Start, ()))
@@ -685,7 +670,6 @@ async fn stop_drains_blocked_write_and_final_flush_and_retains_late_event(driver
 async fn failed_report_marks_degraded_and_retries_successfully(driver: DefaultDriver) {
     let mut fixture = Fixture::new(&driver, false).await;
     fixture.hardware.fail_report.store(true, Ordering::SeqCst);
-    fixture.worker.notification.notify();
     fixture.worker = finish_attempt(fixture.worker, fixture.hardware.reached(1, 0)).await;
     assert_eq!(fixture.worker.checks, 1);
     assert_eq!(fixture.worker.reseals, 0);
@@ -698,16 +682,8 @@ async fn failed_report_marks_degraded_and_retries_successfully(driver: DefaultDr
     );
     assert_eq!(fixture.io.state.lock().writes, 0);
 
-    let deadline = fixture.worker.schedule.deadline;
-    let not_before = fixture.worker.schedule.not_before;
-    fixture.worker.start().await;
-    fixture.worker.stop().await;
-    assert!(fixture.worker.schedule.force_reseal);
-    assert_eq!(fixture.worker.schedule.failures, 1);
-    assert_eq!(fixture.worker.schedule.deadline, deadline);
-    assert_eq!(fixture.worker.schedule.not_before, not_before);
-
     fixture.hardware.fail_report.store(false, Ordering::SeqCst);
+    fixture.worker.schedule.running = true;
     fixture.worker.schedule.deadline = Instant::now();
     fixture.worker.schedule.not_before = Instant::now();
     fixture.worker = finish_attempt(fixture.worker, fixture.hardware.reached(2, 3)).await;
@@ -721,10 +697,9 @@ async fn failed_report_marks_degraded_and_retries_successfully(driver: DefaultDr
 }
 
 #[async_test]
-async fn migration_during_event_flush_is_detected_without_another_event(driver: DefaultDriver) {
+async fn migration_during_flush_is_detected_without_an_event(driver: DefaultDriver) {
     let mut fixture = Fixture::new(&driver, false).await;
     fixture.io.state.lock().block_at = Some((Operation::Flush, 2));
-    fixture.worker.notification.notify();
     let (send, recv) = mesh::mpsc_channel();
     let mut run = pin!(fixture.worker.run(recv));
     drive_until(run.as_mut(), send.call(StateRequest::Start, ()))
@@ -742,7 +717,6 @@ async fn migration_during_event_flush_is_detected_without_another_event(driver: 
     assert_eq!(fixture.worker.reseals, 0);
     assert!(!fixture.worker.notification.pending.load(Ordering::SeqCst));
 
-    fixture.worker.schedule.deadline = Instant::now();
     fixture.worker.schedule.not_before = Instant::now();
     fixture.worker = finish_attempt(fixture.worker, fixture.hardware.reached(2, 6)).await;
     assert!(!fixture.worker.degraded);
@@ -776,7 +750,6 @@ async fn reconstruction_rewrites_after_a_failed_flush(driver: DefaultDriver) {
     let notification = Arc::new(MigrationNotification::default());
     // Match new_underhill_vm's saved-state reconstruction path. Merely
     // verifying the cached protector would lose the pending durability work.
-    // This explicit local restore signal is not a startup or periodic check.
     notification.notify();
     let worker = HardwareReseal::new(
         notification,
@@ -806,7 +779,6 @@ async fn failed_final_flush_retries_write_even_when_cached_protector_matches(
         io.block_at = Some((Operation::Flush, 2));
         io.fail_flush_at = Some(2);
     }
-    fixture.worker.notification.notify();
     let (send, recv) = mesh::mpsc_channel();
     let mut run = pin!(fixture.worker.run(recv));
     drive_until(run.as_mut(), send.call(StateRequest::Start, ()))
@@ -834,6 +806,7 @@ async fn failed_final_flush_retries_write_even_when_cached_protector_matches(
     );
     let derivations = fixture.hardware.derivations.load(Ordering::SeqCst);
     *fixture.io.state.lock() = IoState::default();
+    fixture.worker.schedule.running = true;
     fixture.worker.schedule.deadline = Instant::now();
     fixture.worker.schedule.not_before = Instant::now();
     fixture.worker =

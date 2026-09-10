@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Event-triggered hardware resealing. GET is only a hint: the current hardware
-//! must authenticate the persisted protector. There is no periodic verification
-//! to cover missed events or close the crash window before a durable reseal.
+//! Event-triggered hardware resealing with periodic verification. GET is only a
+//! hint: the current hardware must authenticate the persisted protector. This
+//! cannot close the crash window between migration and a durable reseal.
 
+use anyhow::Context as _;
 use cvm_tracing::CVM_ALLOWED;
 use futures::StreamExt;
 use futures::task::AtomicWaker;
@@ -29,6 +30,7 @@ use vmcore::save_restore::SavedStateBlob;
 use vmgs::FileId;
 use vmgs_broker::VmgsClient;
 
+const VERIFY_INTERVAL: Duration = Duration::from_secs(300);
 const MIN_RESEAL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -57,7 +59,6 @@ impl MigrationNotification {
 #[derive(Inspect)]
 struct Schedule {
     running: bool,
-    // Pending recovery, including retries. Deadlines are ignored when false.
     force_reseal: bool,
     failures: u32,
     #[inspect(skip)]
@@ -91,7 +92,7 @@ impl Schedule {
             self.failures = 0;
             self.force_reseal = false;
             self.not_before = now + MIN_RESEAL_INTERVAL;
-            // No new deadline: stay idle until another notification.
+            self.deadline = now + VERIFY_INTERVAL + Duration::from_secs(u64::from(jitter % 31));
         } else {
             self.failures = self.failures.saturating_add(1);
             // A failed flush may leave a valid protector in cache but not on
@@ -165,9 +166,6 @@ impl HardwareReseal {
                 if self.notification.take(cx) {
                     self.schedule.notified(Instant::now());
                 }
-                if !self.schedule.force_reseal {
-                    return Poll::Pending;
-                }
                 self.timer
                     .poll_until(cx, self.schedule.due())
                     .map(|_| Event::Check)
@@ -215,6 +213,35 @@ impl HardwareReseal {
 
     async fn check(&self) -> anyhow::Result<bool> {
         let key = self.vmgs.active_encryption_key().await?;
+        if !self.schedule.force_reseal {
+            match self.vmgs.read_file(FileId::HW_KEY_PROTECTOR).await {
+                Ok(protector) => {
+                    match runtime_sealing::protector_matches(
+                        &*self.tee,
+                        &self.config,
+                        &protector,
+                        &key,
+                    ) {
+                        Ok(true) => return Ok(false),
+                        Ok(false) => {}
+                        Err(error) => {
+                            // The destination may reject the source SVN. Try
+                            // current report SVN rather than retrying it forever.
+                            tracelimit::warn_ratelimited!(
+                                CVM_ALLOWED,
+                                error = &error as &dyn std::error::Error,
+                                "hardware protector verification failed; trying current hardware"
+                            );
+                        }
+                    }
+                }
+                Err(vmgs_broker::VmgsClientError::Vmgs(
+                    vmgs_broker::VmgsBrokerError::FileInfoNotAllocated,
+                )) => {}
+                Err(error) => return Err(error).context("reading hardware protector"),
+            }
+        }
+
         let protector = runtime_sealing::create_protector(&*self.tee, &self.config, &key)?;
         // Validate with a second hardware derivation, not the seal-time keys.
         anyhow::ensure!(
@@ -249,9 +276,10 @@ impl inspect::InspectMut for HardwareReseal {
 
 impl StateUnit for HardwareReseal {
     async fn start(&mut self) {
-        // Starting or resuming does not create work or reset retry backoff.
-        // Pending notifications and recovery survive a normal stop/start.
         self.schedule.running = true;
+        // Startup verification also covers notifications lost before callback
+        // installation. Resume must not rely on a pre-stop verification.
+        self.schedule.deadline = Instant::now();
     }
 
     async fn stop(&mut self) {
@@ -265,8 +293,7 @@ impl StateUnit for HardwareReseal {
 
     async fn save(&mut self) -> Result<Option<SavedStateBlob>, SaveError> {
         // VMGS owns the DEK. No additional secret or scheduling state is saved;
-        // saved-state reconstruction explicitly notifies the new worker to
-        // rewrite for durability. Starting alone does not trigger recovery.
+        // the newly constructed worker verifies on its first start.
         Ok(None)
     }
 
